@@ -1,0 +1,253 @@
+---
+title: "IoT  Baseline Risk Modeling "
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    number_sections: true
+    theme: united
+    highlight: tango
+    # code_folding: hide
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_depth: 3
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 3200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+#### load packages ####
+library(caret)
+library(tidyverse)
+library(rstan)
+options(mc.cores = 4)
+rstan_options(auto_write = TRUE)
+library(TeachingDemos)
+library(knitr)
+library(kableExtra)
+#### load data ####
+load("~/modeling/BayesFreqSev4.RData")
+```
+
+# Pricing Approach
+1. Estimate pre-sensor baseline risk using custom loss functions (e.g. left truncation for deductible and righ-censoring for limit)
+2. Weakly informative priors due to limited data of smaller clients
+3. Autoencoder with LSTM (asymmetric encoding and decoding layers) as the anomaly detection algorithm to produce false negative rate
+4. Baseline (pre-sensor) loss frequency * false negative rate * pre-sensor severity = post-sensor loss estimate
+5. Post-sensor loss estimate with various pricing factor multipliers will be used as the final IoT warranty price
+
+
+# High Level Modeling Data Summary
+
+## Skip EDA due to data privacy limitations.
+
+
+# Models
+
+
+## Frequency
+
+The frequency model is a simple Poisson GLM using log(Earned Building Years) as an offset. The model is parameterized as follows,
+
+$$
+\begin{align}
+  y_i &\sim \mathcal{P}(\lambda_i)\\
+  \lambda_i &= \exp\left(\beta_0 + \pmb{x}_i^T\pmb{\beta} + \log(\text{Building Years}_i)\right)\\
+\end{align}
+$$
+
+where $y_i$ represents claim counts at location $i$, $\pmb{x}_i$ is a row vector of predictor variables which are all indicator variables defining membership of location in a particular class. We employ hierarchical Bayesian estimation with the following prior distributions,
+
+$$
+\begin{align}
+  \beta_0 &\propto 1\\
+  \pmb{\beta} &\sim \mathcal{T}(4, 0, 1)
+\end{align}
+$$
+
+which places a non-informative flat prior on the intercept and a weakly informative prior on all other regression weights with mild shrinkage properties. This shrinkage prior places substantial prior density around regression weights of 0 (corresponding to a relativity of 1) and requires moderate evidence from the data to update the posterior estimate far from 0. For more detail on this topic please see [Gelman et al. 2008](http://www.stat.columbia.edu/~gelman/research/published/priors11.pdf). This is the mechanism through which we apply "credibility weights" to the estimates.
+
+
+### Frequency Model Adequacy Check
+
+A good test for model adequacy involves examining whether the posterior predictive distribution, as estimated, recovers important observed summary statistics faithfully. In essence, we are averaging over parameter uncertainty and checking to see whether the space of likely model configurations (the posterior distribution) covers what can be reasonably expected given subject matter expertise and observed data. In this case we check to see whether the model can recover the total claim count as observed.
+
+
+```{r postpredfreq, echo=FALSE, error=FALSE, warning=FALSE, message=FALSE}
+# hpdi
+postPredFreqHpdi <- emp.hpd(postTotalDrawsFreq)
+# plot
+postPredFreqCheck <- ggplot() +
+  geom_histogram(aes(x = postTotalDrawsFreq, y = ..density..), fill = "cyan", color = "black") +
+  geom_vline(aes(xintercept = sum(Newark$Number.Claims), color = "Observed"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = mean(postTotalDrawsFreq), color = "Predicted"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = postPredFreqHpdi[2], color = "Predicted"), size = 1, linetype = 2) +
+  geom_vline(aes(xintercept = postPredFreqHpdi[1], color = "Predicted"), size = 1, linetype = 2) +
+  scale_color_manual(values = c("Observed" = "red", "Predicted" = "blue")) +
+  labs(x = "Client A Claim Count", y = "Density", title = "Posterior Predictive Claim Count Check") 
+postPredFreqCheck
+
+```
+
+Though there is still a fair amount of uncertainty, the predictive posterior distribution of total claims for Newark does not assign substantial probability to unreasonably small or large values. Additionally, the mean of the posterior predictive distribution of total  claim counts is very close to what we observed (`r round(mean(postTotalDrawsFreq), 2)` predicted vs. `r sum(Newark$Number.Claims)` observed).
+
+### Frequency Model Results and Conclusions
+
+
+```{r postFreqCalcs, include=FALSE}
+relNewarkFreq <- exp(beta_sourceDrawsFreq[,2])
+relNJFreq <- exp(betaDrawsFreq[,which(names(beta_Freq)=="StateNJ")])
+relNewarkFreqHpdi <- emp.hpd(relNJFreq)
+relNJFreqHpdi <- emp.hpd(relNJFreq)
+```
+
+The posterior mean estimates for the Archdiocese of Newark frequency relativity and the NJ frequency relativity are `r round(mean(relNewarkFreq), 2)` and `r round(mean(relNJFreq), 2)` respectively. The probabilities that these two relativities are greater than one (represent an increase in claims frequency) are `r round(mean(relNewarkFreq > 1), 2)` and $\approx$ `r round(mean(relNJFreq > 1), 2)` respectively. The expected claims frequency for a single exposure unit belonging to the Archdiocese of Newark is therefore $\exp(\hat{\beta}_0 + \hat{\beta}_{Newark} + \hat{\beta}_{NJ})$ = `r round(expectedFreqNewark ,6)`.
+
+
+```{r freqres, echo=FALSE, error=FALSE, warning=FALSE, message=FALSE}
+# plot
+relNewarkPlot <- ggplot() +
+  geom_density(aes(x = relNewarkFreq, y = ..density..), fill = "brown", color = "black") +
+  geom_vline(aes(xintercept = mean(relNewarkFreq), color = "Posterior Mean Relativity"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = relNewarkFreqHpdi[2], color = "95% HPDI"), size = 1, linetype = 2) +
+  geom_vline(aes(xintercept = relNewarkFreqHpdi[1], color = "95% HPDI"), size = 1, linetype = 2) +
+  scale_color_manual(values = c("Posterior Mean Relativity" = "black", "95% HPDI" = "red")) +
+  scale_x_continuous(breaks = c(seq(0,30,2))) +
+  labs(x = "Archdiocese of Newark Relativity", y = "Posterior Density", title = "Archdiocese of Newark Frequency Relativity Posterior Distribution") +
+  theme(legend.position = "bottom")
+relNewarkPlot
+
+relNJPlot <- ggplot() +
+  geom_density(aes(x = relNJFreq, y = ..density..), fill = "brown", color = "black") +
+  geom_vline(aes(xintercept = mean(relNJFreq), color = "Posterior Mean Relativity"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = relNJFreqHpdi[2], color = "95% HPDI"), size = 1, linetype = 2) +
+  geom_vline(aes(xintercept = relNJFreqHpdi[1], color = "95% HPDI"), size = 1, linetype = 2) +
+  scale_color_manual(values = c("Posterior Mean Relativity" = "black", "95% HPDI" = "red")) +
+  scale_x_continuous(breaks = c(seq(0,30,2))) +
+  labs(x = "NJ State Relativity", y = "Posterior Density", title = "NJ State Frequency Relativity Posterior Distribution")+
+  theme(legend.position = "bottom")
+relNJPlot
+```
+
+
+## Severity
+
+The severity model is a simple lognormal regression with a left truncated likelihood to accommodate the fact that all paid claims have exceeded deductible. The model is parameterized as follows,
+
+$$
+\begin{align}
+  z_i &\sim \mathcal{LN}(\mu_i, \sigma)[d_i,]\\
+  \mu_i &= \gamma_0 + \pmb{x}_i^T\pmb{\gamma}\\
+\end{align}
+$$
+
+where $z_i$ represents claim severity at location $i$, $\pmb{x}_i$ is a row vector of predictor variables which are all indicator variables defining membership of location in a particular class with the exception of one variable which contains scaled and centered log(TIV) amounts. We employ hierarchical Bayesian estimation with the following prior distributions,
+
+
+$$
+\begin{align}
+  \gamma_0 &\propto 1\\
+  \pmb{\gamma} &\sim \mathcal{T}(4, 0, 1)\\
+  \sigma &\sim \mathcal{T}^{+}(4, 0, 1)\\
+\end{align}
+$$
+
+The prior structure remains the same except this model includes an additional parameter $\sigma$ on which we place a half-t family prior (a common reference prior for scale or similar parameters).
+
+### Severity Model Adequacy Check
+
+Using the same methods (posterior predictive checks) we check to see whether the model recovers total ground-up severity reasonably well.
+
+```{r postpredsev, echo=FALSE, error=FALSE, warning=FALSE, message=FALSE}
+# hpdi
+postPredSevHpdi <- emp.hpd(postTotalDrawsSev)
+# plot
+postPredSevCheck <- ggplot() +
+  geom_histogram(aes(x = postTotalDrawsSev, y = ..density..), fill = "cyan", color = "black") +
+  geom_vline(aes(xintercept = sum(Newark$total_loss_1kd, na.rm = TRUE), color = "Observed"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = mean(postTotalDrawsSev), color = "Predicted"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = postPredSevHpdi[2], color = "Predicted"), size = 1, linetype = 2) +
+  geom_vline(aes(xintercept = postPredSevHpdi[1], color = "Predicted"), size = 1, linetype = 2) +
+  scale_color_manual(values = c("Observed" = "red", "Predicted" = "blue")) +
+  labs(x = "Client A Total Claim Severity", y = "Density", title = "Posterior Predictive Claim Severity Check") 
+postPredSevCheck
+
+```
+
+The posterior predictive distribution for total ground-up severity reveals more uncertainty in severity model outcomes than we saw in the frequency model. This is to be expected as the severity model is fit to a much smaller sample of data (claims observations only). Nonetheless, the mean of this distribution is close to what we observed and the model should be adequate for our intended inference.
+
+### Severity Model Results and Conclusions
+
+```{r postSevCalcs, include=FALSE}
+relNewarkSev <- exp(beta_sourceDrawsSev[,2])
+relNJSev <- exp(betaDrawsSev[,which(names(beta_sev)=="StateNJ")])
+relNewarkSevHpdi <- emp.hpd(relNJSev)
+relNJSevHpdi <- emp.hpd(relNJSev)
+```
+
+The posterior mean estimates for Client A's severity relativity and the NJ severity relativity are $\approx$ `r round(mean(relNewarkSev), 2)` and `r round(mean(relNJSev), 2)` respectively. The probabilities that these two relativities are less than one (represent a decrease in claims severity) are `r round(mean(relNewarkSev < 1), 2)` and `r round(mean(relNJSev < 1), 2)` respectively. The expected claims severity for this client is therefore $\exp(\hat{\beta}_0 + \hat{\gamma}_{Newark} + \hat{\gamma}_{NJ} + \hat{\gamma}_{\text{log(TIV)}} \text{z-log(TIV)}_{\text{Newark}} + \hat{\sigma}^2/2)$ = `r format(round(expectedSevNewark ,2), scientific = FALSE)`, where $\text{z-log(TIV)}_{\text{Newark}}$ is the z-score for the mean log(TIV) amount in this segment.
+
+
+```{r sevres, echo=FALSE, error=FALSE, warning=FALSE, message=FALSE}
+# plot
+relNewarkPlot2 <- ggplot() +
+  geom_density(aes(x = relNewarkSev, y = ..density..), fill = "brown", color = "black") +
+  geom_vline(aes(xintercept = mean(relNewarkSev), color = "Posterior Mean Relativity"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = relNewarkSevHpdi[2], color = "95% HPDI"), size = 1, linetype = 2) +
+  geom_vline(aes(xintercept = relNewarkSevHpdi[1], color = "95% HPDI"), size = 1, linetype = 2) +
+  scale_color_manual(values = c("Posterior Mean Relativity" = "black", "95% HPDI" = "red")) +
+  labs(x = "Archdiocese of Newark Relativity", y = "Posterior Density", title = "Archdiocese of Newark Severity Relativity Posterior Distribution") +
+  theme(legend.position = "bottom")
+relNewarkPlot2
+
+relNJPlot2 <- ggplot() +
+  geom_density(aes(x = relNJSev, y = ..density..), fill = "brown", color = "black") +
+  geom_vline(aes(xintercept = mean(relNJSev), color = "Posterior Mean Relativity"), size = 1, linetype = 1) +
+  geom_vline(aes(xintercept = relNJSevHpdi[2], color = "95% HPDI"), size = 1, linetype = 2) +
+  geom_vline(aes(xintercept = relNJSevHpdi[1], color = "95% HPDI"), size = 1, linetype = 2) +
+  scale_color_manual(values = c("Posterior Mean Relativity" = "black", "95% HPDI" = "red")) +
+  labs(x = "NJ State Relativity", y = "Posterior Density", title = "NJ State Severity Relativity Posterior Distribution")+
+  theme(legend.position = "bottom")
+relNJPlot2
+```
+
+
+# Loss Cost
+
+## Calculation Details
+
+To calculate expected loss cost given deductible and limit we need the following values.
+
+1. Expected claim frequency for a single exposure unit: $\hat{\lambda}$
+    - This is the expected frequency given the risk location belongs to the Archdiocese of Newark and is adjusted for the global New Jersey (geographic) relativity.
+2. Conditional expected severity (given deductible and limit): $\hat{\theta}$
+    - This is the conditional expectation of a lognormal distribution where deductible = $d$ and limit = $l$ and where the parameter $\mu$ reflects the risk location belongs to the Client A, is adjusted for the global New Jersey (geographic) relativity. The parameter $\sigma$ is shared across clients.
+3. The probability that the ground-up claim amount will exceed a given deductible value $d$: $\hat{P}$
+
+The equation used for this calculation is as follows,
+
+$$
+\begin{align}
+  &\text{loss cost}  = \hat{\lambda}\hat{\theta}\hat{P} \ \ \text{where,}\\
+  &\hat{\lambda} = \exp(\hat{\beta}_0 + \hat{\beta}_{Newark} + \hat{\beta}_{NJ})\\
+  &\hat{\mu} = \exp(\hat{\gamma}_0 + \hat{\gamma}_{Newark} + \hat{\gamma}_{NJ} + \hat{\gamma}_{\text{log(TIV)}} \text{z-log(TIV)}_{\text{Newark}}) \\
+  &g_1 = \Phi\left(\frac{\log(d)-\hat{\mu}}{\hat{\sigma}}\right)\\
+  &g_2 = \Phi\left(\frac{\log(d+l)-\hat{\mu}}{\hat{\sigma}}\right)\\
+  &g_3 = \Phi\left(\frac{\log(d)-\hat{\mu}}{\hat{\sigma}} - \hat{\sigma}\right)\\
+  &g_4 = \Phi\left(\frac{\log(d + l)-\hat{\mu}}{\hat{\sigma}} - \hat{\sigma}\right)\\
+  &\hat{\theta} = e^{\left(\hat{\mu} + \frac{\hat{\sigma}^2}{2}\right)} \left[\frac{g_4 - g_3}{1 - g_1}\right] - d\left[\frac{g_2 - g_1}{1 - g_1}\right] + l\left[\frac{1 - g_2}{1 - g_1}\right]\\
+  &\hat{P} = 1 - \Phi\left(\frac{\log(d)-\hat{\mu}}{\hat{\sigma}}\right)
+\end{align}
+$$
+
+
+
+## Summary statistics will not be displayed due to data privancy limitations.
